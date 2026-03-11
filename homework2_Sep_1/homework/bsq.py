@@ -1,6 +1,7 @@
 import abc
 
 import torch
+import torch.nn.functional as F
 
 from .ae import PatchAutoEncoder
 
@@ -46,7 +47,11 @@ class Tokenizer(abc.ABC):
 class BSQ(torch.nn.Module):
     def __init__(self, codebook_bits: int, embedding_dim: int):
         super().__init__()
-        raise NotImplementedError()
+        self._codebook_bits = codebook_bits
+        self._embedding_dim = embedding_dim
+
+        self.down_proj = torch.nn.Linear(embedding_dim, codebook_bits)
+        self.up_proj = torch.nn.Linear(codebook_bits, embedding_dim)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -55,14 +60,17 @@ class BSQ(torch.nn.Module):
         - L2 normalization
         - differentiable sign
         """
-        raise NotImplementedError()
+        z = self.down_proj(x)
+        z = F.normalize(z, p=2, dim=-1, eps=1e-8)
+        z = diff_sign(z)
+        return z
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         """
         Implement the BSQ decoder:
         - A linear up-projection into embedding_dim should suffice
         """
-        raise NotImplementedError()
+        return self.up_proj(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(x))
@@ -81,10 +89,12 @@ class BSQ(torch.nn.Module):
 
     def _code_to_index(self, x: torch.Tensor) -> torch.Tensor:
         x = (x >= 0).int()
-        return (x * 2 ** torch.arange(x.size(-1)).to(x.device)).sum(dim=-1)
+        return (x * 2 ** torch.arange(x.size(-1), device=x.device)).sum(dim=-1)
 
     def _index_to_code(self, x: torch.Tensor) -> torch.Tensor:
-        return 2 * ((x[..., None] & (2 ** torch.arange(self._codebook_bits).to(x.device))) > 0).float() - 1
+        return 2 * (
+            (x[..., None] & (2 ** torch.arange(self._codebook_bits, device=x.device))) > 0
+        ).float() - 1
 
 
 class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
@@ -97,34 +107,36 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
 
     def __init__(self, patch_size: int = 5, latent_dim: int = 128, codebook_bits: int = 10):
         super().__init__(patch_size=patch_size, latent_dim=latent_dim)
-        raise NotImplementedError()
+        self.codebook_bits = codebook_bits
+        self.quantizer = BSQ(codebook_bits=codebook_bits, embedding_dim=latent_dim)
 
     def encode_index(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+        z = PatchAutoEncoder.encode(self, x)
+        return self.quantizer.encode_index(z)
 
     def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+        z = self.quantizer.decode_index(x)
+        return PatchAutoEncoder.decode(self, z)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+        z = PatchAutoEncoder.encode(self, x)
+        return self.quantizer.encode(z)
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+        z = self.quantizer.decode(x)
+        return PatchAutoEncoder.decode(self, z)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """
-        Return the reconstructed image and a dictionary of additional loss terms you would like to
-        minimize (or even just visualize).
-        Hint: It can be helpful to monitor the codebook usage with
+        z = PatchAutoEncoder.encode(self, x)
+        z_q = self.quantizer.encode(z)
+        z_hat = self.quantizer.decode(z_q)
+        x_hat = PatchAutoEncoder.decode(self, z_hat)
 
-              cnt = torch.bincount(self.encode_index(x).flatten(), minlength=2**self.codebook_bits)
+        cnt = torch.bincount(self.quantizer._code_to_index(z_q).flatten(), minlength=2**self.codebook_bits)
 
-              and returning
-
-              {
-                "cb0": (cnt == 0).float().mean().detach(),
-                "cb2": (cnt <= 2).float().mean().detach(),
-                ...
-              }
-        """
-        raise NotImplementedError()
+        stats = {
+            "cb0": (cnt == 0).float().mean().detach(),
+            "cb2": (cnt <= 2).float().mean().detach(),
+            "cb10": (cnt <= 10).float().mean().detach(),
+        }
+        return x_hat, stats
