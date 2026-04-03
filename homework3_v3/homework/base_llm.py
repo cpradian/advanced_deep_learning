@@ -41,7 +41,6 @@ class BaseLLM:
         - tokenize the prompt with self.tokenizer
         - call self.model.generate
         - decode the outputs with self.tokenizer.decode
-
         """
         return self.batched_generate([prompt])[0]
 
@@ -68,59 +67,77 @@ class BaseLLM:
     ) -> list[str] | list[list[str]]:
         """
         Batched version of `generate` method.
-
-        You will likely get an up to 10x speedup using batched decoding.
-
-        To implement batch decoding you will need to:
-        - tokenize the prompts self.tokenizer with padding=True and return_tensors="pt"
-        - call self.model.generate
-        - decode the outputs with self.tokenizer.batch_decode
-
-        Tip: You need to set self.tokenizer.padding_side = "left" to get the correct padding behavior for generation.
-             Left padding makes sure all sequences are aligned to the right (i.e. where tokens are generated).
-        Tip: self.model.generate takes a lot of parameters. Here are some relevant ones:
-            - max_new_tokens: The maximum number of tokens to generate. Set this to a reasonable value
-                              (50 should suffice).
-            - do_sample and temperature: For any temperature > 0, set do_sample=True.
-                                         do_sample=False will use greedy decoding.
-            - num_return_sequences: The number of sequences to return. Note that this will generate a flat
-                                    list of len(prompts) * num_return_sequences entries.
-            - eos_token_id: The end of sequence token id. This is used to stop generation. Set this
-                            to self.tokenizer.eos_token_id.
-        Pro Tip: Only batch_decode generated tokens by masking out the inputs with
-                 outputs[:, len(inputs["input_ids"][0]) :]
         """
-        from tqdm import tqdm  # Importing tqdm for progress bar
+        from tqdm import tqdm
 
-        # Preventing OOM
-        # Depending on your GPU batched generation will use a lot of memory.
-        # If you run out of memory, try to reduce the micro_batch_size.
         micro_batch_size = 32
         if len(prompts) > micro_batch_size:
-            return [
-                r
-                for idx in tqdm(
-                    range(0, len(prompts), micro_batch_size), desc=f"LLM Running on Micro Batches {micro_batch_size}"
+            all_results = []
+            for idx in tqdm(
+                range(0, len(prompts), micro_batch_size),
+                desc=f"LLM Running on Micro Batches {micro_batch_size}",
+            ):
+                batch_results = self.batched_generate(
+                    prompts[idx : idx + micro_batch_size],
+                    num_return_sequences=num_return_sequences,
+                    temperature=temperature,
                 )
-                for r in self.batched_generate(prompts[idx : idx + micro_batch_size], num_return_sequences, temperature)
-            ]
+                all_results.extend(batch_results)
+            return all_results
 
-        raise NotImplementedError()
+        if num_return_sequences is None:
+            num_return_sequences = 1
+            single_return = True
+        else:
+            single_return = False
+
+        self.tokenizer.padding_side = "left"
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        inputs = self.tokenizer(
+            prompts,
+            padding=True,
+            return_tensors="pt",
+        ).to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=50,
+                do_sample=(temperature > 0),
+                temperature=temperature if temperature > 0 else None,
+                num_return_sequences=num_return_sequences,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+        input_len = inputs["input_ids"].shape[1]
+        generated_only = outputs[:, input_len:]
+
+        decoded = self.tokenizer.batch_decode(
+            generated_only,
+            skip_special_tokens=True,
+        )
+
+        if single_return:
+            return decoded
+
+        grouped = [
+            decoded[i : i + num_return_sequences]
+            for i in range(0, len(decoded), num_return_sequences)
+        ]
+        return grouped
 
     def answer(self, *questions) -> list[float]:
         """
         Answer questions given as individual string arguments.
         """
-        # Convert each question
         prompts = [self.format_prompt(q) for q in questions]
         generations = self.batched_generate(prompts)
         return [self.parse_answer(g) for g in generations]
 
 
 def test_model():
-    # The following code simply tests of the BaseLLM is able to complete text.
-    # It should produce garbage answers, but it should not crash.
-    # In my case it talks about cats eating cats, and dogs being happy.
     testset = ["The cat went up", "The dog went down"]
     model = BaseLLM()
     for t in testset:
