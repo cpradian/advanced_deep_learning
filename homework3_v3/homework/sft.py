@@ -1,10 +1,10 @@
+from pathlib import Path
+
 from .base_llm import BaseLLM
 from .data import Dataset, benchmark
 
 
 def load() -> BaseLLM:
-    from pathlib import Path
-
     from peft import PeftModel
 
     model_name = "sft_model"
@@ -34,7 +34,6 @@ def tokenize(tokenizer, question: str, answer: str):
     input_ids = full["input_ids"]
     question_len = len(tokenizer(question)["input_ids"])
 
-    # Create labels: mask out the prompt part
     labels = [-100] * question_len + input_ids[question_len:]
 
     for i in range(len(labels)):
@@ -49,19 +48,15 @@ def format_example(prompt: str, answer: str) -> dict[str, str]:
     """
     Construct a question / answer pair. Consider rounding the answer to make it easier for the LLM.
     """
-    raise NotImplementedError()
+    answer_value = round(float(answer), 3)
+    return {
+        "question": prompt,
+        "answer": f"<answer>{answer_value}</answer>",
+    }
 
 
 class TokenizedDataset:
     def __init__(self, tokenizer, data: Dataset, format_fn):
-        """
-        Use the
-        - BaseLLM.tokenizer
-        - Dataset
-        - format_fn which converts a data element into a dict with entries
-          - question: str
-          - answer: str
-        """
         self.format_fn = format_fn
         self.tokenizer = tokenizer
         self.data = data
@@ -75,10 +70,55 @@ class TokenizedDataset:
 
 
 def train_model(
-    output_dir: str,
+    output_dir: str | None = None,
     **kwargs,
 ):
-    raise NotImplementedError()
+    from peft import LoraConfig, get_peft_model
+    from transformers import DefaultDataCollator, Trainer, TrainingArguments
+
+    if output_dir is None:
+        output_dir = str(Path(__file__).parent / "sft_model")
+
+    llm = BaseLLM()
+
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=32,
+        target_modules="all-linear",
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    llm.model = get_peft_model(llm.model, lora_config)
+
+    if llm.device == "cuda":
+        llm.model.enable_input_require_grads()
+
+    trainset = TokenizedDataset(llm.tokenizer, Dataset("train"), format_example)
+
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        logging_dir=output_dir,
+        report_to="tensorboard",
+        per_device_train_batch_size=32,
+        num_train_epochs=5,
+        learning_rate=2e-4,
+        gradient_checkpointing=True,
+        save_strategy="epoch",
+        logging_strategy="steps",
+        logging_steps=20,
+        remove_unused_columns=False,
+    )
+
+    trainer = Trainer(
+        model=llm.model,
+        args=training_args,
+        train_dataset=trainset,
+        data_collator=DefaultDataCollator(),
+    )
+
+    trainer.train()
+    trainer.save_model(output_dir)
     test_model(output_dir)
 
 
@@ -86,10 +126,10 @@ def test_model(ckpt_path: str):
     testset = Dataset("valid")
     llm = BaseLLM()
 
-    # Load the model with LoRA adapters
     from peft import PeftModel
 
     llm.model = PeftModel.from_pretrained(llm.model, ckpt_path).to(llm.device)
+    llm.model.eval()
 
     benchmark_result = benchmark(llm, testset, 100)
     print(f"{benchmark_result.accuracy=}  {benchmark_result.answer_rate=}")
