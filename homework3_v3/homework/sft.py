@@ -57,6 +57,14 @@ def format_example(prompt: str, answer: str) -> dict[str, str]:
 
 class TokenizedDataset:
     def __init__(self, tokenizer, data: Dataset, format_fn):
+        """
+        Use the
+        - BaseLLM.tokenizer
+        - Dataset
+        - format_fn which converts a data element into a dict with entries
+          - question: str
+          - answer: str
+        """
         self.format_fn = format_fn
         self.tokenizer = tokenizer
         self.data = data

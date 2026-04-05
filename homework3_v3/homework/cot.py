@@ -12,9 +12,12 @@ class CoTModel(BaseLLM):
                 "role": "system",
                 "content": (
                     "You are a careful unit conversion assistant. "
-                    "Solve the conversion briefly and accurately. "
-                    "Be concise. "
-                    "Always end with the final numeric answer inside <answer></answer> tags."
+                    "Solve the problem briefly and correctly. "
+                    "Only output a short reasoning chain followed by the final answer. "
+                    "Always end with the final numeric answer inside <answer></answer>. "
+                    "Do not put units inside the answer tag. "
+                    "Do not ask follow-up questions. "
+                    "Do not output multiple choice options."
                 ),
             },
             {
@@ -25,13 +28,28 @@ class CoTModel(BaseLLM):
                 "role": "assistant",
                 "content": (
                     "1 kg = 1000 gram. "
-                    "So 2 kg = 2 * 1000 = 2000. "
+                    "2 kg = 2 * 1000 = 2000. "
                     "<answer>2000</answer>"
                 ),
             },
             {
                 "role": "user",
-                "content": question,
+                "content": "How many feet are there in 3 yard?",
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "1 yard = 3 feet. "
+                    "3 yard = 3 * 3 = 9. "
+                    "<answer>9</answer>"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"{question}\n"
+                    "Respond with brief reasoning and then the final numeric answer in <answer></answer>."
+                ),
             },
         ]
 

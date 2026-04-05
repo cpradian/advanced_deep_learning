@@ -70,7 +70,8 @@ class BaseLLM:
         """
         from tqdm import tqdm
 
-        micro_batch_size = 32
+        # Safer default for Colab / larger checkpoints used later
+        micro_batch_size = 4
         if len(prompts) > micro_batch_size:
             all_results = []
             for idx in tqdm(
@@ -100,16 +101,20 @@ class BaseLLM:
             return_tensors="pt",
         ).to(self.device)
 
+        generate_kwargs = dict(
+            **inputs,
+            max_new_tokens=50,
+            min_new_tokens=8,
+            do_sample=(temperature > 0),
+            num_return_sequences=num_return_sequences,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
+        if temperature > 0:
+            generate_kwargs["temperature"] = temperature
+
         with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=50,
-                do_sample=(temperature > 0),
-                temperature=temperature if temperature > 0 else None,
-                num_return_sequences=num_return_sequences,
-                eos_token_id=self.tokenizer.eos_token_id,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
+            outputs = self.model.generate(**generate_kwargs)
 
         input_len = inputs["input_ids"].shape[1]
         generated_only = outputs[:, input_len:]
@@ -138,6 +143,8 @@ class BaseLLM:
 
 
 def test_model():
+    # The following code simply tests of the BaseLLM is able to complete text.
+    # It should produce garbage answers, but it should not crash.
     testset = ["The cat went up", "The dog went down"]
     model = BaseLLM()
     for t in testset:
