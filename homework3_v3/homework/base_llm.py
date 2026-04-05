@@ -71,7 +71,7 @@ class BaseLLM:
         from tqdm import tqdm
 
         # Safer default for Colab / larger checkpoints used later
-        micro_batch_size = 4
+        micro_batch_size = 8
         if len(prompts) > micro_batch_size:
             all_results = []
             for idx in tqdm(

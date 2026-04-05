@@ -3,10 +3,6 @@ from .base_llm import BaseLLM
 
 class CoTModel(BaseLLM):
     def format_prompt(self, question: str) -> str:
-        """
-        Take a question and convert it into a chat template. The LLM will likely answer much
-        better if you provide a chat template. self.tokenizer.apply_chat_template can help here
-        """
         messages = [
             {
                 "role": "system",
