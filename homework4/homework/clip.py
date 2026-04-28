@@ -1,8 +1,10 @@
 from pathlib import Path
 from typing import Any
+import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision as tv
 from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image
@@ -19,8 +21,6 @@ device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is
 
 
 def load(model_name: str = "clip_model"):
-    from pathlib import Path
-
     from peft import PeftModel
 
     model_path = Path(__file__).parent / model_name
@@ -28,11 +28,14 @@ def load(model_name: str = "clip_model"):
     vlm = BaseVLM()
     vision_encoder = vlm.model.model.vision_model
     text_encoder = vlm.model.model.text_model
+
     clip = CLIP(vision_encoder, text_encoder)
     clip = PeftModel.from_pretrained(clip, model_path).to(device)
 
+    # Load projection layers and logit scale.
     clip.model.load_pretrained(model_path)
     clip.model.eval()
+
     if device == "cuda":
         clip = clip.to(dtype=torch.bfloat16)
 
@@ -43,15 +46,25 @@ def clip_data_collator(features: list[dict[str, torch.Tensor]]) -> dict[str, tor
     """
     Custom data collator for CLIP training.
     """
-    # Get max sequence length
     max_length = max(f["input_ids"].shape[0] for f in features)
 
     def pad_tensor(tensor, pad_value):
-        return torch.cat([tensor, torch.full((max_length - tensor.shape[0],), pad_value, dtype=tensor.dtype)])
+        return torch.cat(
+            [
+                tensor,
+                torch.full(
+                    (max_length - tensor.shape[0],),
+                    pad_value,
+                    dtype=tensor.dtype,
+                ),
+            ]
+        )
 
-    input_ids = torch.stack([pad_tensor(f["input_ids"], pad_value=processor.tokenizer.eos_token_id) for f in features])
+    input_ids = torch.stack(
+        [pad_tensor(f["input_ids"], pad_value=processor.tokenizer.eos_token_id) for f in features]
+    )
     attention_mask = torch.stack([pad_tensor(f["attention_mask"], pad_value=0) for f in features])
-    pixel_values = torch.stack([f["pixel_values"] for f in features])  # assume all are same shape
+    pixel_values = torch.stack([f["pixel_values"] for f in features])
     labels = torch.stack([pad_tensor(f["labels"], pad_value=-100) for f in features])
 
     return {
@@ -80,40 +93,78 @@ class CaptionDatasetForTraining(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         item = self.dataset[idx]
+
         image = Image.open(item["image_path"]).convert("RGB")
         pixel_values = self.image_processor(image)
+
+        # Append EOS explicitly. This matters because we use the first EOS hidden state
+        # as the text representation.
         text = item["caption"] + self.processor.tokenizer.eos_token
-        text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True)
+
+        text_inputs = self.processor(
+            text=text,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
+
         input_ids = text_inputs["input_ids"].squeeze(0).long()
-        attention_mask = text_inputs["attention_mask"].squeeze(0)
+        attention_mask = text_inputs["attention_mask"].squeeze(0).long()
+
         return {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "labels": input_ids,  # placeholder to fit the collator
+            "labels": input_ids,  # placeholder to fit the collator / Trainer
         }
 
 
 class CLIP(nn.Module):
     def __init__(
-        self, vision_encoder: nn.Module, text_encoder: nn.Module, proj_dim: int = 64, temperature: float = 0.07
+        self,
+        vision_encoder: nn.Module,
+        text_encoder: nn.Module,
+        proj_dim: int = 64,
+        temperature: float = 0.07,
     ):
         super().__init__()
+
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
-        # TODO: implement the rest components
-        raise NotImplementedError("Not implemented")
+
+        # Infer hidden dimensions from the encoders.
+        vision_hidden_size = getattr(self.vision_encoder.config, "hidden_size", None)
+        text_hidden_size = getattr(self.text_encoder.config, "hidden_size", None)
+
+        if vision_hidden_size is None:
+            raise ValueError("Could not infer vision hidden size from vision_encoder.config.hidden_size")
+
+        if text_hidden_size is None:
+            raise ValueError("Could not infer text hidden size from text_encoder.config.hidden_size")
+
+        self.vision_projection = nn.Linear(vision_hidden_size, proj_dim, bias=False)
+        self.text_projection = nn.Linear(text_hidden_size, proj_dim, bias=False)
+
+        # CLIP uses logits = cosine_similarity * exp(logit_scale).
+        # logit_scale is log(1 / temperature), and should be trainable.
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / temperature)))
+
+        self.eos_token_id = processor.tokenizer.eos_token_id
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         return self.vision_encoder(image)
 
-    def encode_text(self, text: str) -> torch.Tensor:
-        return self.text_encoder(text)
+    def encode_text(self, text: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+        if attention_mask is None:
+            return self.text_encoder(input_ids=text)
+        return self.text_encoder(input_ids=text, attention_mask=attention_mask)
 
     def save_pretrained(self, save_directory: str, **kwargs):
-        """Customize save method, save additional parameters"""
-
+        """
+        Customize save method, save additional parameters.
+        """
         additional_state_dict = {}
+
         for name, param in self.named_parameters():
             if "vision_encoder." in name or "text_encoder." in name:
                 continue
@@ -122,18 +173,26 @@ class CLIP(nn.Module):
         torch.save(additional_state_dict, Path(save_directory) / "additional_weights.pt")
 
     def load_pretrained(self, load_directory: str, **kwargs):
-        """Customize load method, load projection additional parameters"""
-
+        """
+        Customize load method, load projection additional parameters.
+        """
         additional_weights_path = Path(load_directory) / "additional_weights.pt"
+
         if additional_weights_path.exists():
             additional_state_dict = torch.load(additional_weights_path, map_location="cpu")
 
             for name, param in self.named_parameters():
                 if "vision_encoder." in name or "text_encoder." in name:
                     continue
-                param.data = additional_state_dict[name]
+
+                if name in additional_state_dict:
+                    param.data = additional_state_dict[name].to(param.device, dtype=param.dtype)
 
     def set_trainable_parameters(self):
+        """
+        Projection layers and logit_scale should be trainable.
+        LoRA will handle selected vision/text backbone parameters.
+        """
         for name, param in self.named_parameters():
             if "vision_encoder." in name or "text_encoder." in name:
                 continue
@@ -142,7 +201,6 @@ class CLIP(nn.Module):
     def gradient_checkpointing_enable(self, **kwargs):
         """
         Enable gradient checkpointing for the vision and text backbones.
-        (You don't need to touch this method)
         """
         self.vision_encoder.gradient_checkpointing_enable(**kwargs)
         self.text_encoder.gradient_checkpointing_enable(**kwargs)
@@ -150,15 +208,56 @@ class CLIP(nn.Module):
     def enable_input_require_grads(self):
         """
         Enable input require grads for the vision and text backbones.
-        (You don't need to touch this method)
         """
 
-        # Reference: https://discuss.huggingface.co/t/peft-lora-gpt-neox-backward-pass-failing/35641
         def make_inputs_require_grads(module, input, output):  # noqa: A002
             output.requires_grad_(True)
 
         self.vision_encoder.embeddings.register_forward_hook(make_inputs_require_grads)
         self.text_encoder.get_input_embeddings().register_forward_hook(make_inputs_require_grads)
+
+    def _get_last_hidden_state(self, outputs):
+        """
+        Helper for handling either dict-like HF outputs or tuple outputs.
+        """
+        if hasattr(outputs, "last_hidden_state"):
+            return outputs.last_hidden_state
+        if isinstance(outputs, tuple):
+            return outputs[0]
+        raise ValueError("Could not extract last_hidden_state from encoder outputs")
+
+    def _pool_image_features(self, vision_hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Average-pool vision token hidden states.
+
+        Args:
+            vision_hidden_states: Tensor of shape (B, num_patches/tokens, hidden_size)
+
+        Returns:
+            Tensor of shape (B, hidden_size)
+        """
+        return vision_hidden_states.mean(dim=1)
+
+    def _pool_text_features(self, text_hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Use the hidden state at the first EOS token as the text representation.
+
+        The EOS token is used both as the actual EOS and as padding. Since captions
+        have EOS appended before padding, the first EOS is the real end of caption.
+        """
+        batch_size, seq_len = input_ids.shape
+        eos_mask = input_ids.eq(self.eos_token_id)
+
+        # If EOS exists, argmax gives the first EOS because False=0 and True=1.
+        eos_positions = eos_mask.float().argmax(dim=1)
+
+        # If an example somehow has no EOS, fall back to the last token.
+        has_eos = eos_mask.any(dim=1)
+        fallback_positions = torch.full_like(eos_positions, fill_value=seq_len - 1)
+        eos_positions = torch.where(has_eos, eos_positions, fallback_positions)
+
+        batch_indices = torch.arange(batch_size, device=input_ids.device)
+        return text_hidden_states[batch_indices, eos_positions]
 
     def forward(
         self,
@@ -169,18 +268,50 @@ class CLIP(nn.Module):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Forward pass for the CLIP model.
-        Args:
-            pixel_values: The pixel values of the image.
-            input_ids: The input ids of the text.
-            attention_mask: The attention mask of the text.
-            labels: The labels for the text features.
-            (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
-            (Hint: refer to returned values of the __getitem__ method in the CaptionDatasetForTraining class)
+        Forward pass for CLIP.
+
         Returns:
-            TODO: think about the what values should be returned
+            vision_feature:
+                normalized image projections, shape (B, proj_dim)
+
+            text_feature:
+                normalized text projections, shape (B, proj_dim)
+
+            logits:
+                scaled pairwise cosine similarities, shape (B, B)
         """
-        raise NotImplementedError("Not implemented")
+        # Vision encoder
+        vision_outputs = self.vision_encoder(
+            pixel_values=pixel_values,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        vision_hidden_states = self._get_last_hidden_state(vision_outputs)
+        image_pooled = self._pool_image_features(vision_hidden_states)
+
+        # Text encoder
+        text_outputs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        text_hidden_states = self._get_last_hidden_state(text_outputs)
+        text_pooled = self._pool_text_features(text_hidden_states, input_ids)
+
+        # Project to shared embedding space
+        vision_feature = self.vision_projection(image_pooled)
+        text_feature = self.text_projection(text_pooled)
+
+        # L2-normalize
+        vision_feature = F.normalize(vision_feature, p=2, dim=-1)
+        text_feature = F.normalize(text_feature, p=2, dim=-1)
+
+        # Pairwise scaled cosine similarities
+        logit_scale = self.logit_scale.exp().clamp(max=100)
+        logits = torch.matmul(vision_feature, text_feature.T) * logit_scale
+
+        return vision_feature, text_feature, logits
 
 
 def compute_clip_loss(
@@ -189,23 +320,27 @@ def compute_clip_loss(
     num_items_in_batch: int | None = None,
 ) -> torch.Tensor:
     """
-    Compute the loss for the CLIP model.
-    Args:
-        outputs: A tuple containing the outputs of CLIP.forward().
-        labels: The labels for the text features.
-        (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
-        num_items_in_batch: The number of items in the batch.
-        (NOTE: you don't need to use the variable `num_items_in_batch`, this is just for compatibility with Trainer)
-    Returns:
-        The loss for the CLIP model.
+    Compute symmetric CLIP contrastive loss.
+
+    Correct image-text pairs are on the diagonal of the B x B logits matrix.
     """
-    raise NotImplementedError("Not implemented")
+    vision_feature, text_feature, logits = outputs
+
+    batch_size = logits.shape[0]
+    target = torch.arange(batch_size, device=logits.device)
+
+    image_to_text_loss = F.cross_entropy(logits, target)
+    text_to_image_loss = F.cross_entropy(logits.T, target)
+
+    loss = (image_to_text_loss + text_to_image_loss) / 2
+
+    return loss
 
 
 def get_target_modules_for_lora(model: nn.Module) -> list[str]:
     target_modules = []
+
     for name, module in model.named_modules():
-        # if isinstance(module, nn.Linear) and ("vision_encoder" in name and "projection" not in name):
         if (
             isinstance(module, nn.Linear)
             and ("vision_encoder" in name or "text_encoder" in name)
@@ -218,12 +353,12 @@ def get_target_modules_for_lora(model: nn.Module) -> list[str]:
 
 def train(
     data_dir: Path | None = None,
-    output_dir: str = "clip",
-    num_train_epochs: float = 0.05,  # for debugging purpose, increase this once the dry run works
-    per_device_train_batch_size: int = 1024,
+    output_dir: str = "clip_model",
+    num_train_epochs: float = 0.10,
+    per_device_train_batch_size: int = 64,
     gradient_accumulation_steps: int = 1,
     learning_rate: float = 5e-4,
-    num_workers: int = 16,
+    num_workers: int = 8,
 ):
     vlm = BaseVLM()
 
@@ -238,7 +373,12 @@ def train(
     # Initialize model and processor
     vision_encoder = vlm.model.model.vision_model
     text_encoder = vlm.model.model.text_model
-    model = CLIP(vision_encoder, text_encoder).to(device).bfloat16()
+
+    model = CLIP(vision_encoder, text_encoder).to(device)
+
+    if device == "cuda":
+        model = model.bfloat16()
+
     model.set_trainable_parameters()
 
     peft_config = LoraConfig(
@@ -247,10 +387,10 @@ def train(
         r=8,
         lora_alpha=32,
         lora_dropout=0.0,
-        # target_modules="all-linear",
         target_modules=get_target_modules_for_lora(model),
         bias="none",
     )
+
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
     model.to(device)
@@ -258,7 +398,7 @@ def train(
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
 
-    # load dataset
+    # Load dataset
     train_dataset = CaptionDataset("train", data_dir)
     train_dataset = CaptionDatasetForTraining(train_dataset, processor)
 
@@ -290,8 +430,10 @@ def train(
 
     trainer.train()
 
-    # save model
+    # Save LoRA model
     trainer.save_model(output_dir)
+
+    # Save projection layers and logit_scale
     model.model.save_pretrained(output_dir)
 
     writer.close()
@@ -301,7 +443,6 @@ def train(
 
 def demo_train():
     train(
-        train_dataset_name="train_demo",
         output_dir="demo_clip",
         num_train_epochs=1,
         per_device_train_batch_size=2,
@@ -333,19 +474,29 @@ def test(ckpt_path: str, val_dataset: str = "valid_grader"):
 
     for pair in tqdm.tqdm(testset):
         image = Image.open(pair["image_path"]).convert("RGB")
-        pixel_values = image_processor(image).unsqueeze(0).to(device).bfloat16()
+
+        pixel_values = image_processor(image).unsqueeze(0).to(device)
+
+        if device == "cuda":
+            pixel_values = pixel_values.bfloat16()
+
         text_inputs = processor(
             text=[s + processor.tokenizer.eos_token for s in pair["candidates"]],
             return_tensors="pt",
             padding=True,
             truncation=True,
         )
+
         input_ids = text_inputs["input_ids"].long().to(device)
         attention_mask = text_inputs["attention_mask"].to(device)
+
         vision_feature, text_feature, _ = clip(pixel_values, input_ids, attention_mask)
+
         prediction = torch.matmul(vision_feature, text_feature.T).argmax(dim=-1)
-        if prediction == pair["correct_index"]:
+
+        if prediction.item() == pair["correct_index"]:
             correct_count += 1
+
         total_count += 1
 
     print(f"Accuracy: {correct_count / total_count}")
@@ -354,7 +505,7 @@ def test(ckpt_path: str, val_dataset: str = "valid_grader"):
 def main():
     from fire import Fire
 
-    Fire({"train": train, "test": test})
+    Fire({"train": train, "test": test, "demo_train": demo_train})
 
 
 if __name__ == "__main__":
